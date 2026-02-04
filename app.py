@@ -1,154 +1,135 @@
 
 import os
 import sys
-from enum import Enum
-from PIL import Image
+import cv2
 import numpy as np
 from tkinter import Tk, filedialog
+from scipy.spatial import cKDTree
 
-# Constants for output directories and image dimensions
-OUTPUT_DIR = 'output'  # Directory where processed images will be saved
-CARD_DIM = (745, 1040)	# Target dimensions for card images
-IMG_EXT = ('.png', '.jpg', '.jpeg')	 # Supported image file extensions
-CROP = 2 # Pixels to crop each edge
-BLEED_LENGTH = 36 + CROP # Bleed length in pixels for adding bleed edges
+OUTPUT_DIR = "output"
+IMG_EXT = (".png", ".jpg", ".jpeg")
+CARD_DIM = (745, 1040)
+EDGE_CROP = 2
+CORNER_CROP = 10
 
-# Initialize INPUT_DIR only when running as main script, not when imported
-INPUT_DIR = None
-
-if __name__ == '__main__':
-	root = Tk()
-	root.withdraw()
-	INPUT_DIR = filedialog.askdirectory(title="Select Folder with Cards")
+def GetImages(input_dir) -> list[str]:
+	"""
+	Recursively fetch image paths.
+	"""
 	
-	if not INPUT_DIR:
-		sys.exit()
-
-# Ensure the output directory exists
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-def getImgs(input_dir=INPUT_DIR) -> list[str]:
-	"""
-	Recursively fetches all image file paths from the specified directory.
-	"""
 	imgs = []
 	
-	for file in os.listdir(input_dir):
-		path = os.path.join(input_dir, file)
-		
-		if os.path.isdir(path):
-			imgs += getImgs(path)  # Recursively get images from subdirectories
-		elif path.endswith(IMG_EXT):  # Check if the file has a valid extension
-			imgs.append(path)
+	for root, dirs, files in os.walk(input_dir):
+		for file in files:
+			if file.lower().endswith(IMG_EXT):
+				imgs.append(os.path.join(root, file))
+	
 	return imgs
 
-def resizeImg(img_path, output_dir=OUTPUT_DIR) -> str:
+def FillCorners(img):
 	"""
-	Resizes an image to the specified dimensions and saves it.
-	Returns the path to the resized image.
+	Fill corners with color.
 	"""
-	with Image.open(img_path) as img:
-		output_path = img_path	# Default to the original path
-		
-		if img.size != CARD_DIM:
-			# Resize image if it does not match the target dimensions
-			img = img.resize(CARD_DIM, Image.Resampling.LANCZOS)
-		
-		# 2 pixel crop
-		img = img.crop((CROP, CROP, img.width - CROP, img.height - CROP))
-		
-		output_path = os.path.join(output_dir, os.path.basename(img_path))
-		img.save(output_path, quality=95)  # Save resized image
-	return output_path
 	
-def addBleedEdge(img_path, output_dir=OUTPUT_DIR) -> str:
-	"""
-	Adds a bleed edge to an image using either a simple black border 
-	or replicated edges, depending on the image perimeter properties.
-	"""
-	output_path = os.path.join(output_dir, os.path.basename(img_path))
+	# 1. Generate mask
+	if (img.shape[2] == 4) and img[0, 0, 3] < 10:
+		# 1A. Transparent corners (corner pixel has an alpha value less than 10)
+		_, card_mask = cv2.threshold(img[:, :, 3], 0, 255, cv2.THRESH_BINARY)
+	else:
+		# 1B. Color corners
+		bgr = img[:, :, :3]
+		bg_color = bgr[0, 0]
+		
+		lower = np.clip(bg_color - 10, 0, 255)
+		upper = np.clip(bg_color + 10, 0, 255)
+		bg_mask = cv2.inRange(bgr, lower, upper)
+		
+		height, width = img.shape[:2]
+		flood_mask = np.zeros((height + 2, width + 2), np.uint8)
+		
+		corners = [(0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)]
+		
+		for x, y in corners:
+			if bg_mask[y, x] == 255:
+				cv2.floodFill(bg_mask, flood_mask, (x, y), 128)
+		
+		_, corner_mask = cv2.threshold(bg_mask, 127, 255, cv2.THRESH_BINARY)
+		card_mask = cv2.bitwise_not(corner_mask)
 	
-	with Image.open(img_path) as img:
-		# Calculate new dimensions including the bleed area
-		total_width = img.width + 2 * BLEED_LENGTH
-		total_height = img.height + 2 * BLEED_LENGTH
-		new_dim = (total_width, total_height)
-		
-		# Add replicated edges as the border
-		bleed_img = Image.new("RGB", new_dim)
-		x, y = BLEED_LENGTH, BLEED_LENGTH
-		bleed_img.paste(img, (x, y))
-		
-		# Replicate and flip top, left, right, and bottom edges
-		top = img.crop((0, 0, img.width, BLEED_LENGTH))
-		new_top = top.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-		
-		left = img.crop((0, 0, BLEED_LENGTH, img.height))
-		new_left = left.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-		
-		right = img.crop((img.width - BLEED_LENGTH, 0, img.width, img.height))
-		new_right = right.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-		
-		bottom = img.crop((0, img.height - BLEED_LENGTH, img.width, img.height))
-		new_bottom = bottom.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-		
-		# Replicate and flip corners
-		new_left_corner = new_left.crop((0, 0, BLEED_LENGTH, BLEED_LENGTH)).transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-		new_right_corner = new_right.crop((0, 0, BLEED_LENGTH, BLEED_LENGTH)).transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-		new_left_bottom_corner = new_left.crop((0, img.height - BLEED_LENGTH, BLEED_LENGTH, img.height)).transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-		new_right_bottom_corner = new_right.crop((0, img.height - BLEED_LENGTH, BLEED_LENGTH, img.height)).transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-		
-		# Paste replicated edges and corners onto the image
-		bleed_img.paste(new_top, (BLEED_LENGTH, 0))
-		bleed_img.paste(new_left, (0, BLEED_LENGTH))
-		bleed_img.paste(new_right, (img.width + BLEED_LENGTH, BLEED_LENGTH))
-		bleed_img.paste(new_bottom, (BLEED_LENGTH, img.height + BLEED_LENGTH))
-		bleed_img.paste(new_left_corner, (0, 0))
-		bleed_img.paste(new_right_corner, (img.width + BLEED_LENGTH, 0))
-		bleed_img.paste(new_left_bottom_corner, (0, img.height + BLEED_LENGTH))
-		bleed_img.paste(new_right_bottom_corner, (img.width + BLEED_LENGTH, img.height + BLEED_LENGTH))
-		
-		bleed_img.save(output_path, quality=95, dpi=(300,300))
-	return output_path
+	# 2. Erode card mask
+	kernel = np.ones((3, 3), np.uint8)
+	card_mask_eroded = cv2.erode(card_mask, kernel, iterations=CORNER_CROP)
+	
+	# 3. Find border pixels
+	y_hole, x_hole = np.where(card_mask_eroded == 0)
+	
+	contours, _ = cv2.findContours(card_mask_eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+	source_pixel_mask = np.zeros_like(card_mask)
+	cv2.drawContours(source_pixel_mask, contours, -1, 255, 1)
+	
+	y_valid, x_valid = np.where(source_pixel_mask == 255)
+	valid_pixels = np.column_stack((x_valid, y_valid))
+	pixels_to_fill = np.column_stack((x_hole, y_hole))
+	
+	# 4. Fill corners
+	tree = cKDTree(valid_pixels)
+	_, indices = tree.query(pixels_to_fill)
+	nearest_coords = valid_pixels[indices]
+	
+	# 5. Apply colors
+	img[y_hole, x_hole] = img[nearest_coords[:, 1], nearest_coords[:, 0]]
+	
+	return img
 
-def getPerimeter(img_path) -> np.array:
+def ProcessCard(img_path, output_dir):
 	"""
-	Extracts the perimeter pixels of an image as a flattened array.
+	Modify a card to add bleed edges.
 	"""
-	with Image.open(img_path) as img:
-		img = img.convert('RGB')
-		pixels = np.array(img)
-		
-		# Extract top, left, right, and bottom edges of the image
-		top = pixels[0, :]
-		left = pixels[1:-1, 0]
-		right = pixels[1:-1, -1]
-		bottom = pixels[-1, :]
-		
-		# Combine perimeter pixels into a single array
-		perimeter = np.concatenate((top, left, right, bottom), axis=0)
-	return perimeter
+	
+	# 1. Load image
+	img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+	
+	# 2. Resize image
+	interpolation = cv2.INTER_AREA if (img.shape[1] > CARD_DIM[0]) else cv2.INTER_LANCZOS4
+	img = cv2.resize(img, CARD_DIM, interpolation=interpolation)
+	
+	# 3. Crop edges
+	height, width = img.shape[:2]
+	img = img[EDGE_CROP:height - EDGE_CROP, EDGE_CROP:width - EDGE_CROP]
+	
+	# 4. Fill corners
+	img = FillCorners(img)
+	
+	# 5. Add mirrored bleed edges
+	bleed_length = 36 + EDGE_CROP
+	
+	img = cv2.copyMakeBorder(
+		img,
+		bleed_length, bleed_length, bleed_length, bleed_length,
+		cv2.BORDER_REFLECT_101
+	)
+	
+	# 6. Save image
+	filename = os.path.basename(img_path)
+	save_path = os.path.join(output_dir, filename)
+	
+	cv2.imwrite(save_path, img)
 
 def main():
-	"""
-	Main function to process images by resizing them and adding bleed edges.
-	"""
-	print("Processing Images...")
+	root = Tk()
+	root.withdraw()
 	
-	img_paths = getImgs()  # Get list of input images
-	if not img_paths:
-		print("No images")	# Exit if no images are found
-		exit()
+	print("Select the input folder")
+	input_dir = filedialog.askdirectory(title="Select folder with cards")
 	
-	rz_paths = []  # List to store paths of resized images
-	for path in img_paths:
-		rz_paths.append(resizeImg(path))
+	os.makedirs(OUTPUT_DIR, exist_ok=True)
+	img_paths = GetImages(input_dir)
 	
-	bleeds = []	 # List to store paths of images with bleed edges
-	for path in rz_paths:
-		bleeds.append(addBleedEdge(path))
+	print(f"Processing {len(img_paths)} images...")
+	for _, path in enumerate(img_paths):
+		ProcessCard(path, OUTPUT_DIR)
 	
-	print(f"Successfully Created {len(bleeds)} Bleed Edge Images")
+	print(f"Finished processing {len(img_paths)} images")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
 	main()
