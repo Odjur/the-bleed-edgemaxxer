@@ -38,10 +38,10 @@ def FillCorners(img):
 	else:
 		# 1B. Color corners
 		bgr = img[:, :, :3]
-		bg_color = bgr[0, 0]
+		bg_color = bgr[0, 0].astype(np.int16)
 		
-		lower = np.clip(bg_color - 10, 0, 255)
-		upper = np.clip(bg_color + 10, 0, 255)
+		lower = np.clip(bg_color - 15, 0, 255).astype(np.uint8)
+		upper = np.clip(bg_color + 15, 0, 255).astype(np.uint8)
 		bg_mask = cv2.inRange(bgr, lower, upper)
 		
 		height, width = img.shape[:2]
@@ -53,7 +53,7 @@ def FillCorners(img):
 			if bg_mask[y, x] == 255:
 				cv2.floodFill(bg_mask, flood_mask, (x, y), 128)
 		
-		_, corner_mask = cv2.threshold(bg_mask, 127, 255, cv2.THRESH_BINARY)
+		corner_mask = cv2.inRange(bg_mask, 128, 128)
 		card_mask = cv2.bitwise_not(corner_mask)
 	
 	# 2. Erode card mask
